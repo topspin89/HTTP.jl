@@ -34,23 +34,45 @@ function request(::Type{AWS4AuthLayer{Next}},
     return request(Next, url, req, body; kw...)
 end
 
+# Normalize whitespace to the form required in the canonical headers.
+# Note that the expected format for multiline headers seems not to be explicitly
+# documented, but Amazon provides a test case for it, so we'll match that behavior.
+# We replace each `\n` with a `,` and remove all whitespace around the newlines,
+# then any remaining contiguous whitespace is replaced with a single space.
+function _normalize_ws(s::AbstractString)
+    if any(isequal('\n'), s)
+        join(map(_normalize_ws, split(s, '\n')), ',')
+    else
+        replace(strip(s), r"\s+" => " ")
+    end
+end
+
 function sign_aws4!(method::String,
                     url::URI,
                     headers::Headers,
                     body::Vector{UInt8};
                     body_sha256::Vector{UInt8}=digest(MD_SHA256, body),
                     body_md5::Vector{UInt8}=digest(MD_MD5, body),
-                    t::DateTime=now(Dates.UTC),
+                    t::Union{DateTime,Nothing}=nothing,
+                    timestamp::DateTime=now(Dates.UTC),
                     aws_service::String=String(split(url.host, ".")[1]),
                     aws_region::String=String(split(url.host, ".")[2]),
                     aws_access_key_id::String=ENV["AWS_ACCESS_KEY_ID"],
                     aws_secret_access_key::String=ENV["AWS_SECRET_ACCESS_KEY"],
                     aws_session_token::String=get(ENV, "AWS_SESSION_TOKEN", ""),
+                    token_in_signature=true,
+                    include_md5=true,
+                    include_sha256=true,
                     kw...)
+    if t !== nothing
+        Base.depwarn("The `t` keyword argument to `sign_aws4!` is deprecated; use " *
+                     "`timestamp` instead.", :sign_aws4!)
+        timestamp = t
+    end
 
     # ISO8601 date/time strings for time of request...
-    date = Dates.format(t, dateformat"yyyymmdd")
-    datetime = Dates.format(t, dateformat"yyyymmddTHHMMSS\Z")
+    date = Dates.format(timestamp, dateformat"yyyymmdd")
+    datetime = Dates.format(timestamp, dateformat"yyyymmddTHHMMSS\Z")
 
     # Authentication scope...
     scope = [date, aws_region, aws_service, "aws4_request"]
@@ -69,29 +91,60 @@ function sign_aws4!(method::String,
 
     # HTTP headers...
     rmkv(headers, "Authorization")
-    setkv(headers, "x-amz-content-sha256",  content_hash)
-    setkv(headers, "x-amz-date",  datetime)
-    setkv(headers, "Content-MD5", base64encode(body_md5))
+    setkv(headers, "host", url.host)
+    setkv(headers, "x-amz-date", datetime)
+    include_md5 && setkv(headers, "Content-MD5", base64encode(body_md5))
+    if (aws_service == "s3" && method == "PUT") || include_sha256
+        # This header is required for S3 PUT requests. See the documentation at
+        # https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
+        setkv(headers, "x-amz-content-sha256", content_hash)
+    end
     if aws_session_token != ""
         setkv(headers, "x-amz-security-token", aws_session_token)
     end
 
     # Sort and lowercase() Headers to produce canonical form...
-    canonical_headers = ["$(lowercase(k)):$(strip(v))" for (k,v) in headers]
-    signed_headers = join(sort([lowercase(k) for (k,v) in headers]), ";")
+    unique_header_keys = Vector{String}()
+    normalized_headers = Dict{String,Vector{String}}()
+    for (k, v) in sort!([lowercase(k) => v for (k, v) in headers], by=first)
+        # Some services want the token included as part of the signature
+        if k == "x-amz-security-token" && !token_in_signature
+            continue
+        end
+        # In Amazon's examples, they exclude Content-Length from signing. This does not
+        # appear to be addressed in the documentation, so we'll just mimic the example.
+        if k == "content-length"
+            continue
+        end
+        if !haskey(normalized_headers, k)
+            normalized_headers[k] = Vector{String}()
+            push!(unique_header_keys, k)
+        end
+        push!(normalized_headers[k], _normalize_ws(v))
+    end
+    canonical_headers = map(unique_header_keys) do k
+        string(k, ':', join(normalized_headers[k], ','))
+    end
+    signed_headers = join(unique_header_keys, ';')
 
     # Sort Query String...
-    query = queryparams(url.query)
-    query = Pair[k => query[k] for k in sort(collect(keys(query)))]
+    query = sort!(collect(queryparams(url.query)), by=first)
+
+    # Paths for requests to S3 should be escaped but not normalized. See
+    # http://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html#canonical-request
+    # Note that escapepath escapes ~ per RFC 1738, but Amazon includes an example in their
+    # signature v4 test suite where ~ remains unescaped. We follow the spec here and thus
+    # deviate from Amazon's example in this case.
+    path = escapepath(aws_service == "s3" ? url.path : URIs.normpath(url.path))
 
     # Create hash of canonical request...
-    canonical_form = string(method, "\n",
-                            aws_service == "s3" ? url.path
-                                                : escapepath(url.path), "\n",
-                            escapeuri(query), "\n",
-                            join(sort(canonical_headers), "\n"), "\n\n",
-                            signed_headers, "\n",
-                            content_hash)
+    canonical_form = join([method,
+                           path,
+                           escapeuri(query),
+                           join(canonical_headers, "\n"),
+                           "",
+                           signed_headers,
+                           content_hash], "\n")
     @debug 3 "AWS4 canonical_form: $canonical_form"
 
     canonical_hash = bytes2hex(digest(MD_SHA256, canonical_form))
